@@ -49,9 +49,21 @@ using namespace GFLAGS_NAMESPACE;
 using namespace std;
 using namespace GOOGLE_NAMESPACE;
 
-#if defined(HAVE_STACKTRACE) && defined(__ELF__)
+#if defined(HAVE_STACKTRACE)
 
 #define always_inline
+
+// A wrapper function for Symbolize() to make the unit test simple.
+static const char *TrySymbolize(void *pc) {
+  static char symbol[4096];
+  if (Symbolize(pc, symbol, sizeof(symbol))) {
+    return symbol;
+  } else {
+    return NULL;
+  }
+}
+
+# if defined(__ELF__)
 
 // This unit tests make sense only with GCC.
 // Uses lots of GCC specific features.
@@ -70,18 +82,9 @@ using namespace GOOGLE_NAMESPACE;
 #  endif  // defined(__i386__) || defined(__x86_64__)
 #endif
 
-// A wrapper function for Symbolize() to make the unit test simple.
-static const char *TrySymbolize(void *pc) {
-  static char symbol[4096];
-  if (Symbolize(pc, symbol, sizeof(symbol))) {
-    return symbol;
-  } else {
-    return NULL;
-  }
-}
-
 // Make them C linkage to avoid mangled names.
 extern "C" {
+void nonstatic_func();
 void nonstatic_func() {
   volatile int a = 0;
   ++a;
@@ -99,7 +102,13 @@ TEST(Symbolize, Symbolize) {
 
   // Compilers should give us pointers to them.
   EXPECT_STREQ("nonstatic_func", TrySymbolize((void *)(&nonstatic_func)));
-  EXPECT_STREQ("static_func", TrySymbolize((void *)(&static_func)));
+
+  // The name of an internal linkage symbol is not specified; allow either a
+  // mangled or an unmangled name here.
+  const char *static_func_symbol = TrySymbolize((void *)(&static_func));
+  CHECK(NULL != static_func_symbol);
+  EXPECT_TRUE(strcmp("static_func", static_func_symbol) == 0 ||
+              strcmp("static_func()", static_func_symbol) == 0);
 
   EXPECT_TRUE(NULL == TrySymbolize(NULL));
 }
@@ -254,8 +263,13 @@ static const char *SymbolizeStackConsumption(void *pc, int *stack_consumed) {
   return g_symbolize_result;
 }
 
+#ifdef __ppc64__
+// Symbolize stack consumption should be within 4kB.
+const int kStackConsumptionUpperLimit = 4096;
+#else
 // Symbolize stack consumption should be within 2kB.
 const int kStackConsumptionUpperLimit = 2048;
+#endif
 
 TEST(Symbolize, SymbolizeStackConsumption) {
   int stack_consumed;
@@ -267,9 +281,13 @@ TEST(Symbolize, SymbolizeStackConsumption) {
   EXPECT_GT(stack_consumed, 0);
   EXPECT_LT(stack_consumed, kStackConsumptionUpperLimit);
 
+  // The name of an internal linkage symbol is not specified; allow either a
+  // mangled or an unmangled name here.
   symbol = SymbolizeStackConsumption((void *)(&static_func),
                                      &stack_consumed);
-  EXPECT_STREQ("static_func", symbol);
+  CHECK(NULL != symbol);
+  EXPECT_TRUE(strcmp("static_func", symbol) == 0 ||
+              strcmp("static_func()", symbol) == 0);
   EXPECT_GT(stack_consumed, 0);
   EXPECT_LT(stack_consumed, kStackConsumptionUpperLimit);
 }
@@ -300,6 +318,7 @@ inline void* always_inline inline_func() {
   return pc;
 }
 
+void* ATTRIBUTE_NOINLINE non_inline_func();
 void* ATTRIBUTE_NOINLINE non_inline_func() {
   register void *pc = NULL;
 #ifdef TEST_X86_32_AND_64
@@ -308,7 +327,7 @@ void* ATTRIBUTE_NOINLINE non_inline_func() {
   return pc;
 }
 
-void ATTRIBUTE_NOINLINE TestWithPCInsideNonInlineFunction() {
+static void ATTRIBUTE_NOINLINE TestWithPCInsideNonInlineFunction() {
 #if defined(TEST_X86_32_AND_64) && defined(HAVE_ATTRIBUTE_NOINLINE)
   void *pc = non_inline_func();
   const char *symbol = TrySymbolize(pc);
@@ -318,7 +337,7 @@ void ATTRIBUTE_NOINLINE TestWithPCInsideNonInlineFunction() {
 #endif
 }
 
-void ATTRIBUTE_NOINLINE TestWithPCInsideInlineFunction() {
+static void ATTRIBUTE_NOINLINE TestWithPCInsideInlineFunction() {
 #if defined(TEST_X86_32_AND_64) && defined(HAVE_ALWAYS_INLINE)
   void *pc = inline_func();  // Must be inlined.
   const char *symbol = TrySymbolize(pc);
@@ -330,7 +349,7 @@ void ATTRIBUTE_NOINLINE TestWithPCInsideInlineFunction() {
 }
 
 // Test with a return address.
-void ATTRIBUTE_NOINLINE TestWithReturnAddress() {
+static void ATTRIBUTE_NOINLINE TestWithReturnAddress() {
 #if defined(HAVE_ATTRIBUTE_NOINLINE)
   void *return_address = __builtin_return_address(0);
   const char *symbol = TrySymbolize(return_address);
@@ -340,11 +359,50 @@ void ATTRIBUTE_NOINLINE TestWithReturnAddress() {
 #endif
 }
 
+# elif defined(OS_WINDOWS) || defined(OS_CYGWIN)
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#pragma intrinsic(_ReturnAddress)
+#endif
+
+struct Foo {
+  static void func(int x);
+};
+
+__declspec(noinline) void Foo::func(int x) {
+  volatile int a = x;
+  ++a;
+}
+
+TEST(Symbolize, SymbolizeWithDemangling) {
+  Foo::func(100);
+  const char* ret = TrySymbolize((void *)(&Foo::func));
+  EXPECT_STREQ("public: static void __cdecl Foo::func(int)", ret);
+}
+
+__declspec(noinline) void TestWithReturnAddress() {
+  void *return_address =
+#ifdef __GNUC__ // Cygwin and MinGW support
+	  __builtin_return_address(0)
+#else
+	  _ReturnAddress()
+#endif
+	  ;
+  const char *symbol = TrySymbolize(return_address);
+  CHECK(symbol != NULL);
+  CHECK_STREQ(symbol, "main");
+  cout << "Test case TestWithReturnAddress passed." << endl;
+}
+# endif  // __ELF__
+#endif  // HAVE_STACKTRACE
+
 int main(int argc, char **argv) {
   FLAGS_logtostderr = true;
   InitGoogleLogging(argv[0]);
   InitGoogleTest(&argc, argv);
-#ifdef HAVE_SYMBOLIZE
+#if defined(HAVE_SYMBOLIZE)
+# if defined(__ELF__)
   // We don't want to get affected by the callback interface, that may be
   // used to install some callback function at InitGoogle() time.
   InstallSymbolizeCallback(NULL);
@@ -353,18 +411,15 @@ int main(int argc, char **argv) {
   TestWithPCInsideNonInlineFunction();
   TestWithReturnAddress();
   return RUN_ALL_TESTS();
-#else
-  return 0;
-#endif
-}
-
-#else
-int main() {
-#ifdef HAVE_SYMBOLIZE
+# elif defined(OS_WINDOWS) || defined(OS_CYGWIN)
+  TestWithReturnAddress();
+  return RUN_ALL_TESTS();
+# else  // OS_WINDOWS
   printf("PASS (no symbolize_unittest support)\n");
+  return 0;
+# endif  // __ELF__
 #else
   printf("PASS (no symbolize support)\n");
-#endif
   return 0;
+#endif  // HAVE_SYMBOLIZE
 }
-#endif  // HAVE_STACKTRACE

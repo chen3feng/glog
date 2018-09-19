@@ -114,11 +114,6 @@ GLOG_DEFINE_bool(drop_log_memory, true, "Drop in-memory buffers of log contents.
                  "Logs can grow very quickly and they are rarely read before they "
                  "need to be evicted from memory. Instead, drop them from memory "
                  "as soon as they are flushed to disk.");
-_START_GOOGLE_NAMESPACE_
-namespace logging {
-static const int64 kPageSize = getpagesize();
-}
-_END_GOOGLE_NAMESPACE_
 #endif
 
 // By default, errors (including fatal errors) get logged to stderr as
@@ -188,7 +183,7 @@ GLOG_DEFINE_string(log_backtrace_at, "",
 
 #ifndef HAVE_PREAD
 #if defined(OS_WINDOWS)
-#include <BaseTsd.h>
+#include <basetsd.h>
 #define ssize_t SSIZE_T
 #endif
 static ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
@@ -260,6 +255,9 @@ static bool TerminalSupportsColor() {
       !strcmp(term, "xterm-color") ||
       !strcmp(term, "xterm-256color") ||
       !strcmp(term, "screen-256color") ||
+      !strcmp(term, "konsole") ||
+      !strcmp(term, "konsole-16color") ||
+      !strcmp(term, "konsole-256color") ||
       !strcmp(term, "screen") ||
       !strcmp(term, "linux") ||
       !strcmp(term, "cygwin");
@@ -301,7 +299,7 @@ static GLogColor SeverityToColor(LogSeverity severity) {
 #ifdef OS_WINDOWS
 
 // Returns the character attribute for the given color.
-WORD GetColorAttribute(GLogColor color) {
+static WORD GetColorAttribute(GLogColor color) {
   switch (color) {
     case COLOR_RED:    return FOREGROUND_RED;
     case COLOR_GREEN:  return FOREGROUND_GREEN;
@@ -313,7 +311,7 @@ WORD GetColorAttribute(GLogColor color) {
 #else
 
 // Returns the ANSI color code for the given color.
-const char* GetAnsiColorCode(GLogColor color) {
+static const char* GetAnsiColorCode(GLogColor color) {
   switch (color) {
   case COLOR_RED:     return "1";
   case COLOR_GREEN:   return "2";
@@ -438,6 +436,7 @@ class LogFileObject : public base::Logger {
   FILE* file_;
   LogSeverity severity_;
   uint32 bytes_since_flush_;
+  uint32 dropped_mem_length_;
   uint32 file_length_;
   unsigned int rollover_attempt_;
   int64 next_flush_time_;         // cycle count at which to flush log
@@ -825,6 +824,7 @@ void LogDestination::DeleteLogDestinations() {
   }
   MutexLock l(&sink_mutex_);
   delete sinks_;
+  sinks_ = NULL;
 }
 
 namespace {
@@ -838,6 +838,7 @@ LogFileObject::LogFileObject(LogSeverity severity,
     file_(NULL),
     severity_(severity),
     bytes_since_flush_(0),
+    dropped_mem_length_(0),
     file_length_(0),
     rollover_attempt_(kRolloverAttemptFrequency-1),
     next_flush_time_(0) {
@@ -975,7 +976,7 @@ void LogFileObject::Write(bool force_flush,
       PidHasChanged()) {
     if (file_ != NULL) fclose(file_);
     file_ = NULL;
-    file_length_ = bytes_since_flush_ = 0;
+    file_length_ = bytes_since_flush_ = dropped_mem_length_ = 0;
     rollover_attempt_ = kRolloverAttemptFrequency-1;
   }
 
@@ -1115,11 +1116,17 @@ void LogFileObject::Write(bool force_flush,
        (CycleClock_Now() >= next_flush_time_) ) {
     FlushUnlocked();
 #ifdef OS_LINUX
-    if (FLAGS_drop_log_memory) {
-      if (file_length_ >= logging::kPageSize) {
-        // don't evict the most recent page
-        uint32 len = file_length_ & ~(logging::kPageSize - 1);
-        posix_fadvise(fileno(file_), 0, len, POSIX_FADV_DONTNEED);
+    // Only consider files >= 3MiB
+    if (FLAGS_drop_log_memory && file_length_ >= (3 << 20)) {
+      // Don't evict the most recent 1-2MiB so as not to impact a tailer
+      // of the log file and to avoid page rounding issue on linux < 4.7
+      uint32 total_drop_length = (file_length_ & ~((1 << 20) - 1)) - (1 << 20);
+      uint32 this_drop_length = total_drop_length - dropped_mem_length_;
+      if (this_drop_length >= (2 << 20)) {
+        // Only advise when >= 2MiB to drop
+        posix_fadvise(fileno(file_), dropped_mem_length_, this_drop_length,
+                      POSIX_FADV_DONTNEED);
+        dropped_mem_length_ = total_drop_length;
       }
     }
 #endif
@@ -1140,6 +1147,14 @@ static CrashReason crash_reason;
 static bool fatal_msg_exclusive = true;
 static LogMessage::LogMessageData fatal_msg_data_exclusive;
 static LogMessage::LogMessageData fatal_msg_data_shared;
+
+#ifdef GLOG_THREAD_LOCAL_STORAGE
+// Static thread-local log data space to use, because typically at most one
+// LogMessageData object exists (in this case glog makes zero heap memory
+// allocations).
+static GLOG_THREAD_LOCAL_STORAGE bool thread_data_available = true;
+static GLOG_THREAD_LOCAL_STORAGE char thread_msg_data[sizeof(LogMessage::LogMessageData)];
+#endif // defined(GLOG_THREAD_LOCAL_STORAGE)
 
 LogMessage::LogMessageData::LogMessageData()
   : stream_(message_text_, LogMessage::kMaxLogMessageLen, 0) {
@@ -1197,8 +1212,19 @@ void LogMessage::Init(const char* file,
                       void (LogMessage::*send_method)()) {
   allocated_ = NULL;
   if (severity != GLOG_FATAL || !exit_on_dfatal) {
+#ifdef GLOG_THREAD_LOCAL_STORAGE
+    // No need for locking, because this is thread local.
+    if (thread_data_available) {
+      thread_data_available = false;
+      data_ = new (&thread_msg_data) LogMessageData;
+    } else {
+      allocated_ = new LogMessageData();
+      data_ = allocated_;
+    }
+#else // !defined(GLOG_THREAD_LOCAL_STORAGE)
     allocated_ = new LogMessageData();
     data_ = allocated_;
+#endif // defined(GLOG_THREAD_LOCAL_STORAGE)
     data_->first_fatal_ = false;
   } else {
     MutexLock l(&fatal_msg_lock);
@@ -1267,7 +1293,17 @@ void LogMessage::Init(const char* file,
 
 LogMessage::~LogMessage() {
   Flush();
+#ifdef GLOG_THREAD_LOCAL_STORAGE
+  if (data_ == static_cast<void*>(thread_msg_data)) {
+    data_->~LogMessageData();
+    thread_data_available = true;
+  }
+  else {
+    delete allocated_;
+  }
+#else // !defined(GLOG_THREAD_LOCAL_STORAGE)
   delete allocated_;
+#endif // defined(GLOG_THREAD_LOCAL_STORAGE)
 }
 
 int LogMessage::preserved_errno() const {
@@ -1462,16 +1498,13 @@ void LogMessage::RecordCrashReason(
 # define ATTRIBUTE_NORETURN
 #endif
 
+#if defined(OS_WINDOWS)
+__declspec(noreturn)
+#endif
 static void logging_fail() ATTRIBUTE_NORETURN;
 
 static void logging_fail() {
-#if defined(_DEBUG) && defined(_MSC_VER)
-  // When debugging on windows, avoid the obnoxious dialog and make
-  // it possible to continue past a LOG(FATAL) in the debugger
-  __debugbreak();
-#else
   abort();
-#endif
 }
 
 typedef void (*logging_fail_func_t)() ATTRIBUTE_NORETURN;
@@ -1677,6 +1710,7 @@ void LogToStderr() {
 namespace base {
 namespace internal {
 
+bool GetExitOnDFatal();
 bool GetExitOnDFatal() {
   MutexLock l(&log_mutex);
   return exit_on_dfatal;
@@ -1692,6 +1726,7 @@ bool GetExitOnDFatal() {
 // and the stack trace is not recorded.  The LOG(FATAL) *will* still
 // exit the program.  Since this function is used only in testing,
 // these differences are acceptable.
+void SetExitOnDFatal(bool value);
 void SetExitOnDFatal(bool value) {
   MutexLock l(&log_mutex);
   exit_on_dfatal = value;
@@ -1699,6 +1734,42 @@ void SetExitOnDFatal(bool value) {
 
 }  // namespace internal
 }  // namespace base
+
+// Shell-escaping as we need to shell out ot /bin/mail.
+static const char kDontNeedShellEscapeChars[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz"
+            "0123456789+-_.=/:,@";
+
+static string ShellEscape(const string& src) {
+  string result;
+  if (!src.empty() &&  // empty string needs quotes
+      src.find_first_not_of(kDontNeedShellEscapeChars) == string::npos) {
+    // only contains chars that don't need quotes; it's fine
+    result.assign(src);
+  } else if (src.find_first_of('\'') == string::npos) {
+    // no single quotes; just wrap it in single quotes
+    result.assign("'");
+    result.append(src);
+    result.append("'");
+  } else {
+    // needs double quote escaping
+    result.assign("\"");
+    for (size_t i = 0; i < src.size(); ++i) {
+      switch (src[i]) {
+        case '\\':
+        case '$':
+        case '"':
+        case '`':
+          result.append("\\");
+      }
+      result.append(src, i, 1);
+    }
+    result.append("\"");
+  }
+  return result;
+}
+
 
 // use_logging controls whether the logging functions LOG/VLOG are used
 // to log errors.  It should be set to false when the caller holds the
@@ -1715,7 +1786,10 @@ static bool SendEmailInternal(const char*dest, const char *subject,
     }
 
     string cmd =
-        FLAGS_logmailer + " -s\"" + subject + "\" " + dest;
+        FLAGS_logmailer + " -s" +
+        ShellEscape(subject) + " " + ShellEscape(dest);
+    VLOG(4) << "Mailing command: " << cmd;
+
     FILE* pipe = popen(cmd.c_str(), "w");
     if (pipe != NULL) {
       // Add the body if we have one

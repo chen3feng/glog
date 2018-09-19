@@ -34,7 +34,9 @@
 
 #include "utilities.h"
 
-#include <pthread.h>
+#if defined(HAVE_PTHREAD)
+# include <pthread.h>
+#endif
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,7 +50,7 @@ using namespace GFLAGS_NAMESPACE;
 
 using namespace GOOGLE_NAMESPACE;
 
-void* DieInThread(void*) {
+static void* DieInThread(void*) {
   // We assume pthread_t is an integral number or a pointer, rather
   // than a complex struct.  In some environments, pthread_self()
   // returns an uint64 but in some other environments pthread_self()
@@ -62,7 +64,7 @@ void* DieInThread(void*) {
   return NULL;
 }
 
-void WriteToStdout(const char* data, int size) {
+static void WriteToStdout(const char* data, int size) {
   if (write(STDOUT_FILENO, data, size) < 0) {
     // Ignore errors.
   }
@@ -87,12 +89,20 @@ int main(int argc, char **argv) {
     fprintf(stderr, "looping\n");
     while (true);
   } else if (command == "die_in_thread") {
+#if defined(HAVE_PTHREAD)
     pthread_t thread;
     pthread_create(&thread, NULL, &DieInThread, NULL);
     pthread_join(thread, NULL);
+#else
+    fprintf(stderr, "no pthread\n");
+    return 1;
+#endif
   } else if (command == "dump_to_stdout") {
     InstallFailureWriter(WriteToStdout);
     abort();
+  } else if (command == "installed") {
+    fprintf(stderr, "signal handler installed: %s\n",
+        IsFailureSignalHandlerInstalled() ? "true" : "false");
   } else {
     // Tell the shell script
     puts("OK");
