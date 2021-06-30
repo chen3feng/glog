@@ -33,7 +33,7 @@
 
 #include "utilities.h"
 
-#include <signal.h>
+#include <csignal>
 #include <iostream>
 
 #include "glog/logging.h"
@@ -311,7 +311,7 @@ TEST(Symbolize, SymbolizeWithDemanglingStackConsumption) {
 // x86 specific tests.  Uses some inline assembler.
 extern "C" {
 inline void* always_inline inline_func() {
-  register void *pc = NULL;
+  void *pc = NULL;
 #ifdef TEST_X86_32_AND_64
   __asm__ __volatile__("call 1f; 1: pop %0" : "=r"(pc));
 #endif
@@ -320,7 +320,7 @@ inline void* always_inline inline_func() {
 
 void* ATTRIBUTE_NOINLINE non_inline_func();
 void* ATTRIBUTE_NOINLINE non_inline_func() {
-  register void *pc = NULL;
+  void *pc = NULL;
 #ifdef TEST_X86_32_AND_64
   __asm__ __volatile__("call 1f; 1: pop %0" : "=r"(pc));
 #endif
@@ -401,7 +401,7 @@ int main(int argc, char **argv) {
   FLAGS_logtostderr = true;
   InitGoogleLogging(argv[0]);
   InitGoogleTest(&argc, argv);
-#if defined(HAVE_SYMBOLIZE)
+#if defined(HAVE_SYMBOLIZE) && defined(HAVE_STACKTRACE)
 # if defined(__ELF__)
   // We don't want to get affected by the callback interface, that may be
   // used to install some callback function at InitGoogle() time.

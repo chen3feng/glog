@@ -29,7 +29,7 @@
 //
 // Author: Ray Sidney
 
-#include "config_for_unittests.h"
+#include "config.h"
 #include "utilities.h"
 
 #include <fcntl.h>
@@ -40,7 +40,13 @@
 #ifdef HAVE_UNISTD_H
 # include <unistd.h>
 #endif
+#ifdef HAVE_SYS_WAIT_H
+# include <sys/wait.h>
+#endif
 
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -48,9 +54,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-
-#include <stdio.h>
-#include <stdlib.h>
 
 #include "base/commandlineflags.h"
 #include "glog/logging.h"
@@ -95,6 +98,7 @@ static void TestLogging(bool check_counts);
 static void TestRawLogging();
 static void LogWithLevels(int v, int severity, bool err, bool alsoerr);
 static void TestLoggingLevels();
+static void TestVLogModule();
 static void TestLogString();
 static void TestLogSink();
 static void TestLogToString();
@@ -103,11 +107,14 @@ static void TestCHECK();
 static void TestDCHECK();
 static void TestSTREQ();
 static void TestBasename();
+static void TestBasenameAppendWhenNoTimestamp();
+static void TestTwoProcessesWrite();
 static void TestSymlink();
 static void TestExtension();
 static void TestWrapper();
 static void TestErrno();
 static void TestTruncate();
+static void TestCustomLoggerDeletionOnShutdown();
 
 static int x = -1;
 static void BM_Check1(int n) {
@@ -176,6 +183,7 @@ BENCHMARK(BM_vlog);
 
 int main(int argc, char **argv) {
   FLAGS_colorlogtostderr = false;
+  FLAGS_timestamp_in_logfile_name = true;
 #ifdef HAVE_LIB_GFLAGS
   ParseCommandLineFlags(&argc, &argv, true);
 #endif
@@ -190,7 +198,11 @@ int main(int argc, char **argv) {
   LogWithLevels(0, 0, 0, 0);  // simulate "before global c-tors"
   const string early_stderr = GetCapturedTestStderr();
 
+  EXPECT_FALSE(IsGoogleLoggingInitialized());
+
   InitGoogleLogging(argv[0]);
+
+  EXPECT_TRUE(IsGoogleLoggingInitialized());
 
   RunSpecifiedBenchmarks();
 
@@ -212,6 +224,7 @@ int main(int argc, char **argv) {
   TestLogging(true);
   TestRawLogging();
   TestLoggingLevels();
+  TestVLogModule();
   TestLogString();
   TestLogSink();
   TestLogToString();
@@ -227,13 +240,14 @@ int main(int argc, char **argv) {
   FLAGS_logtostderr = false;
 
   TestBasename();
+  TestBasenameAppendWhenNoTimestamp();
+  TestTwoProcessesWrite();
   TestSymlink();
   TestExtension();
   TestWrapper();
   TestErrno();
   TestTruncate();
-
-  ShutdownGoogleLogging();
+  TestCustomLoggerDeletionOnShutdown();
 
   fprintf(stdout, "PASS\n");
   return 0;
@@ -441,6 +455,24 @@ void TestLoggingLevels() {
   LogWithLevels(1, GLOG_FATAL, false, true);
 }
 
+int TestVlogHelper() {
+  if (VLOG_IS_ON(1)) {
+    return 1;
+  }
+  return 0;
+}
+
+void TestVLogModule() {
+  int c = TestVlogHelper();
+  EXPECT_EQ(0, c);
+
+#if defined(__GNUC__)
+  EXPECT_EQ(0, SetVLOGLevel("logging_unittest", 1));
+  c = TestVlogHelper();
+  EXPECT_EQ(1, c);
+#endif
+}
+
 TEST(DeathRawCHECK, logging) {
   ASSERT_DEATH(RAW_CHECK(false, "failure 1"),
                "RAW: Check false failed: failure 1");
@@ -487,9 +519,16 @@ class TestLogSinkImpl : public LogSink {
   virtual void send(LogSeverity severity, const char* /* full_filename */,
                     const char* base_filename, int line,
                     const struct tm* tm_time,
-                    const char* message, size_t message_len) {
+                    const char* message, size_t message_len, int usecs) {
     errors.push_back(
-      ToString(severity, base_filename, line, tm_time, message, message_len));
+      ToString(severity, base_filename, line, tm_time, message, message_len, usecs));
+  }
+  virtual void send(LogSeverity severity, const char* full_filename,
+                    const char* base_filename, int line,
+                    const struct tm* tm_time,
+                    const char* message, size_t message_len) {
+    send(severity, full_filename, base_filename, line,
+         tm_time, message, message_len, 0);
   }
 };
 
@@ -572,9 +611,10 @@ void TestDCHECK() {
   DCHECK_GT(2, 1);
   DCHECK_LT(1, 2);
 
-  auto_ptr<int64> sptr(new int64);
-  int64* ptr = DCHECK_NOTNULL(sptr.get());
-  CHECK_EQ(ptr, sptr.get());
+  int64* orig_ptr = new int64;
+  int64* ptr = DCHECK_NOTNULL(orig_ptr);
+  CHECK_EQ(ptr, orig_ptr);
+  delete orig_ptr;
 }
 
 void TestSTREQ() {
@@ -658,7 +698,8 @@ static void DeleteFiles(const string& pattern) {
   }
 }
 
-static void CheckFile(const string& name, const string& expected_string) {
+//check string is in file (or is *NOT*, depending on optional checkInFileOrNot)
+static void CheckFile(const string& name, const string& expected_string, const bool checkInFileOrNot = true) {
   vector<string> files;
   GetFiles(name + "*", &files);
   CHECK_EQ(files.size(), 1UL);
@@ -667,13 +708,16 @@ static void CheckFile(const string& name, const string& expected_string) {
   CHECK(file != NULL) << ": could not open " << files[0];
   char buf[1000];
   while (fgets(buf, sizeof(buf), file) != NULL) {
-    if (strstr(buf, expected_string.c_str()) != NULL) {
+    char* first = strstr(buf, expected_string.c_str());
+    //if first == NULL, not found.
+    //Terser than if (checkInFileOrNot && first != NULL || !check...
+    if (checkInFileOrNot != (first == NULL)) {
       fclose(file);
       return;
     }
   }
   fclose(file);
-  LOG(FATAL) << "Did not find " << expected_string << " in " << files[0];
+  LOG(FATAL) << "Did " << (checkInFileOrNot? "not " : "") << "find " << expected_string << " in " << files[0];
 }
 
 static void TestBasename() {
@@ -690,6 +734,65 @@ static void TestBasename() {
   // Release file handle for the destination file to unlock the file in Windows.
   LogToStderr();
   DeleteFiles(dest + "*");
+}
+
+static void TestBasenameAppendWhenNoTimestamp() {
+  fprintf(stderr, "==== Test setting log file basename without timestamp and appending properly\n");
+  const string dest = FLAGS_test_tmpdir + "/logging_test_basename_append_when_no_timestamp";
+  DeleteFiles(dest + "*");
+
+  ofstream out(dest.c_str());
+  out << "test preexisting content" << endl;
+  out.close();
+
+  CheckFile(dest, "test preexisting content");
+
+  FLAGS_timestamp_in_logfile_name=false;
+  SetLogDestination(GLOG_INFO, dest.c_str());
+  LOG(INFO) << "message to new base, appending to preexisting file";
+  FlushLogFiles(GLOG_INFO);
+  FLAGS_timestamp_in_logfile_name=true;
+
+  //if the logging overwrites the file instead of appending it will fail.
+  CheckFile(dest, "test preexisting content");
+  CheckFile(dest, "message to new base, appending to preexisting file");
+
+  // Release file handle for the destination file to unlock the file in Windows.
+  LogToStderr();
+  DeleteFiles(dest + "*");
+}
+
+static void TestTwoProcessesWrite() {
+// test only implemented for platforms with fork & wait; the actual implementation relies on flock
+#if defined(HAVE_SYS_WAIT_H) && defined(HAVE_UNISTD_H) && defined(HAVE_FCNTL)
+  fprintf(stderr, "==== Test setting log file basename and two processes writing - second should fail\n");
+  const string dest = FLAGS_test_tmpdir + "/logging_test_basename_two_processes_writing";
+  DeleteFiles(dest + "*");
+
+  //make both processes write into the same file (easier test)
+  FLAGS_timestamp_in_logfile_name=false;
+  SetLogDestination(GLOG_INFO, dest.c_str());
+  LOG(INFO) << "message to new base, parent";
+  FlushLogFiles(GLOG_INFO);
+
+  pid_t pid = fork();
+  CHECK_ERR(pid);
+  if (pid == 0) {
+    LOG(INFO) << "message to new base, child - should only appear on STDERR not on the file";
+    ShutdownGoogleLogging(); //for children proc
+    exit(0);
+  } else if (pid > 0) {
+    wait(NULL);
+  }
+  FLAGS_timestamp_in_logfile_name=true;
+
+  CheckFile(dest, "message to new base, parent");
+  CheckFile(dest, "message to new base, child - should only appear on STDERR not on the file", false);
+
+  // Release
+  LogToStderr();
+  DeleteFiles(dest + "*");
+#endif
 }
 
 static void TestSymlink() {
@@ -857,6 +960,41 @@ static void TestTruncate() {
 #endif
 }
 
+struct RecordDeletionLogger : public base::Logger {
+  RecordDeletionLogger(bool* set_on_destruction,
+                       base::Logger* wrapped_logger) :
+      set_on_destruction_(set_on_destruction),
+      wrapped_logger_(wrapped_logger)
+  {
+    *set_on_destruction_ = false;
+  }
+  virtual ~RecordDeletionLogger() {
+    *set_on_destruction_ = true;
+  }
+  virtual void Write(bool force_flush,
+                     time_t timestamp,
+                     const char* message,
+                     int length) {
+    wrapped_logger_->Write(force_flush, timestamp, message, length);
+  }
+  virtual void Flush() { wrapped_logger_->Flush(); }
+  virtual uint32 LogSize() { return wrapped_logger_->LogSize(); }
+ private:
+  bool* set_on_destruction_;
+  base::Logger* wrapped_logger_;
+};
+
+static void TestCustomLoggerDeletionOnShutdown() {
+  bool custom_logger_deleted = false;
+  base::SetLogger(GLOG_INFO,
+                  new RecordDeletionLogger(&custom_logger_deleted,
+                                           base::GetLogger(GLOG_INFO)));
+  EXPECT_TRUE(IsGoogleLoggingInitialized());
+  ShutdownGoogleLogging();
+  EXPECT_TRUE(custom_logger_deleted);
+  EXPECT_FALSE(IsGoogleLoggingInitialized());
+}
+
 _START_GOOGLE_NAMESPACE_
 namespace glog_internal_namespace_ {
 extern  // in logging.cc
@@ -1009,15 +1147,23 @@ class TestWaitingLogSink : public LogSink {
   virtual void send(LogSeverity severity, const char* /* full_filename */,
                     const char* base_filename, int line,
                     const struct tm* tm_time,
-                    const char* message, size_t message_len) {
+                    const char* message, size_t message_len, int usecs) {
     // Push it to Writer thread if we are the original logging thread.
     // Note: Something like ThreadLocalLogSink is a better choice
     //       to do thread-specific LogSink logic for real.
     if (pthread_equal(tid_, pthread_self())) {
       writer_.Buffer(ToString(severity, base_filename, line,
-                              tm_time, message, message_len));
+                              tm_time, message, message_len, usecs));
     }
   }
+
+  virtual void send(LogSeverity severity, const char* full_filename,
+                    const char* base_filename, int line,
+                    const struct tm* tm_time,
+                    const char* message, size_t message_len) {
+    send(severity, full_filename, base_filename, line, tm_time, message, message_len);
+  }
+
   virtual void WaitTillSent() {
     // Wait for Writer thread if we are the original logging thread.
     if (pthread_equal(tid_, pthread_self()))  writer_.Wait();
@@ -1075,13 +1221,14 @@ TEST(Strerror, logging) {
 
 // Simple routines to look at the sizes of generated code for LOG(FATAL) and
 // CHECK(..) via objdump
+/*
 static void MyFatal() {
   LOG(FATAL) << "Failed";
 }
 static void MyCheck(bool a, bool b) {
   CHECK_EQ(a, b);
 }
-
+*/
 #ifdef HAVE_LIB_GMOCK
 
 TEST(DVLog, Basic) {

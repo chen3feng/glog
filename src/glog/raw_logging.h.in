@@ -36,7 +36,7 @@
 #ifndef BASE_RAW_LOGGING_H_
 #define BASE_RAW_LOGGING_H_
 
-#include <time.h>
+#include <ctime>
 
 @ac_google_start_namespace@
 
@@ -64,8 +64,8 @@
 //   RAW_LOG(ERROR, "Failed foo with %i: %s", status, error);
 //   RAW_VLOG(3, "status is %i", status);
 // These will print an almost standard log lines like this to stderr only:
-//   E0821 211317 file.cc:123] RAW: Failed foo with 22: bad_file
-//   I0821 211317 file.cc:142] RAW: status is 20
+//   E20200821 211317 file.cc:123] RAW: Failed foo with 22: bad_file
+//   I20200821 211317 file.cc:142] RAW: status is 20
 #define RAW_LOG(severity, ...) \
   do { \
     switch (@ac_google_namespace@::GLOG_ ## severity) {  \
@@ -174,11 +174,6 @@ GOOGLE_GLOG_DLL_DECL void RawLog__(LogSeverity severity,
                                    int line,
                                    const char* format, ...)
    @ac_cv___attribute___printf_4_5@;
-
-// Hack to propagate time information into this module so that
-// this module does not have to directly call localtime_r(),
-// which could allocate memory.
-GOOGLE_GLOG_DLL_DECL void RawLog__SetLastTime(const struct tm& t, int usecs);
 
 @ac_google_end_namespace@
 
